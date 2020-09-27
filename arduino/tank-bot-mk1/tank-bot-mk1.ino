@@ -32,6 +32,14 @@
  * https://learn.adafruit.com/adafruit-crickit-creative-robotic-interactive-construction-kit)
  *
  * use of RPLIDAR requires the non-standard library https://github.com/robopeak/rplidar_arduino
+ * 
+ * IMPORTANT NOTE: at the time of this writing, the RPLidar Adruino library has a bug. The
+ * RPLidar::begin method is declared to return bool but it does not actually return a value.
+ * In my testing, this caused the controller to lock up. This can be fixed by editing the
+ * files RPLidar.h and RPLidar.cpp and changing the RPLidar::begin method to return void in
+ * both places.
+ * 
+ *     void begin(HardwareSerial &serialobj);
  *
  * the RPLIDAR is connected as generally described in the documentation (see
  * http://www.robopeak.net/data/doc/rplidar/appnote/RPLDAPPN01-rplidar_appnote_arduinolib-enUS.pdf)
@@ -65,10 +73,13 @@ const unsigned int RPLIDAR_MOTOR = 12;
 
 // keep a global buffer representing the most recent scan of the surroundings
 // each bin is a ten-degree segment (0-9.99, 10-19.99, etc.)
+// if you want to use a different bin / buffer size, keep in mind that the
+// code is currently optimized for an even number of bins and an even
+// number of degrees in each bin. so good values of NAV_BUFFER_SIZE would
+// be 18, 20, 30, 36, 60, 90, 180
 struct nav_scan
 {
   unsigned int distanceNear;
-  unsigned int distanceFar;
   unsigned int pointCount;
 };
 const unsigned int NAV_BUFFER_SIZE = 36;
@@ -79,8 +90,7 @@ void initNavBuffer()
   debug("InitNavBuffer()");
   for (unsigned int i = 0; i < NAV_BUFFER_SIZE; i++)
   {
-    navBuffer[i].distanceNear = 0.0;
-    navBuffer[i].distanceFar = 0.0;
+    navBuffer[i].distanceNear = 0;
     navBuffer[i].pointCount = 0;
   }
 }
@@ -108,22 +118,22 @@ unsigned int vehicleStatus = STATUS_INITIALIZING;
  * need to be changed to display the code in binary; currently
  * it just lights the single neopixel for the code)
  */
-const unsigned int FAIL_DEBUG = 0;    // SETUP_ONLY set, so we halt after setup()
-const unsigned int FAIL_CRICKIT = 1;  // crickit.begin() failed - check power
+const unsigned int FAIL_DEBUG = 0;                // SETUP_ONLY set, so we halt after setup()
+const unsigned int FAIL_CRICKIT = 1;              // crickit.begin() failed - check power
 
 /*
  * configuration values
  */
 
-// set to TRUE for debugging over a tethered USB connection
-const bool USB_DEBUG = true;
+// uncomment this line for debugging over a tethered USB connection
+// #define USB_DEBUG
 
 // set to TRUE to halt after setup, for testing only
 const bool SETUP_ONLY = false;
 
 // threshold for calling a halt based on unsafe vehicle attitude (0.0 - 10.0)
 // lower values will allow a steeper tilt before halting.
-const float TILT_THRESHOLD = 8.0;
+const float TILT_THRESHOLD = 7.0;
 
 // brightness of the circuitplayground's built-in neopixel ring (used for
 // indicating vehicle status); scale is 0 - 255 but it gets BRIGHT.
@@ -134,37 +144,43 @@ const unsigned int PIXEL_BRIGHTNESS = 16;
 const float MOTOR_FORWARD = 0.8;
 const float MOTOR_REVERSE = -0.8;
 
-// size of the frontal cone to check for obstacles. 180 degrees is straight
-// ahead (to simplify the buffer indexing), so if this parameter is set to 50,
-// the obstacle avoidance function will consider data between 130 degrees and
-// 230 degrees (a total of 100 degrees). this should be a multiple of the
-// navigation buffer bin size (e.g., with 36 bins, each bin is 10 degrees, so
-// this would be a multiple of 10).
-const unsigned int NAV_AVOID_CONE = 30;
+// size of the frontal cone to check for obstacles, specified in number of
+// sectors off-center. for example, if this parameter is set to 2, then the
+// sector immediately ahead of the vehicle and the 2 sectors on either side
+// will be watched. to continue the example, if NAV_BUFFER_SIZE=36, each
+// sector is 10 degrees, so the area watched ends up being 50 degrees (5*10).
+const unsigned int NAV_AVOID_CONE = 2;
 
 // distance (in mm) from an obstacle at which the vehicle will maneuver to
 // avoid the obstacle
 const unsigned int NAV_AVOID_DISTANCE = 500;
 
-// a weighting factor for scoring escape routes when an obstacle is encountered.
-// values greater than 1.0 value the openness of the route (available distance)
-// more than they value minimizing the deviation from the vehicle's current
-// course. values less than 1.0 value minimizing deviation more.
-const float ESCAPE_WEIGHT = 0.75;
-
-// when avoiding an obstacle, we locate an escape route, and then turn until
-// we see the same distance measurement in front of us that we saw on the
-// chosen route. this tolerance is used for that comparison (e.g., 0.2 means
-// that we accept a measured distance within +/-20% as being a match
-const float ESCAPE_TOLERANCE = 0.33;
-
-// provide the ability to pause and re-scan when an obstacle is encountered,
-// to decide if it was a moving obstacle. value in ms. set to 0 to disable.
-const unsigned int MANEUVER_DELAY = 0;
+// distance (in mm) of free space that must exist on a potential escape route
+// for the vehicle to consider that route.
+const unsigned int NAV_ESCAPE_DISTANCE = 1000;
 
 // setting to collect more than one complete LIDAR rotation in a "scan".
-// this must be at least 1.
+// this must be at least 1. values higher than 1 may help the vehicle make
+// better maneuvering decisions, but interfere with the actual maneuvering
+// because the time spent scanning extends the length of the decision-making
+// cycle.
 const unsigned int OVERSCAN = 1;
+
+// LIDAR motor speed (0-255)
+const unsigned int LIDAR_MOTOR_SPEED = 255;
+
+// minimum distance, inside which LIDAR data points are thrown out. this is
+// used to filter out spurious data points at unreasonably close distances
+// (inside the perimeter of the vehicle or thereabouts). value in mm.
+// the datasheet lists minimum measurable distance as 150mm, so that's a
+// good initial value.
+const unsigned int LIDAR_MINIMUM_DISTANCE = 150;
+
+// minimum quality, beneath which LIDAR data points are thrown out. this is
+// a score assigned by the device, and its meaning is not documented (it is
+// an unsigned byte coming from the device). in practice, most data points
+// are observed to be quality = 15.
+const unsigned int LIDAR_MINIMUM_QUALITY = 12;
 
 /*
  * vehicle status functions
@@ -250,24 +266,17 @@ void fullStop()
 // caller should return to main loop after calling this function
 void haelp()
 {
-  setStatus(STATUS_HALT_TEMPORARY);
-  driveStop();
-  // wait for a left-button press to return to main loop
-  while (true)
+  if (vehicleStatus != STATUS_HALT_PERMANENT)
   {
-    if (CircuitPlayground.leftButton()) return;
-    delay(200);
+    setStatus(STATUS_HALT_TEMPORARY);
+    driveStop();
+    // wait for a start-button press to return to main loop
+    while (true)
+    {
+      if (CircuitPlayground.leftButton()) return;
+      delay(200);
+    }
   }
-}
-
-// check for halt button - if a function will run for more than 1 sec,
-// it should call this function during its processing (at least every 1 sec).
-// return TRUE if a vehicle halt was requested - in this case, caller
-// must ensure that control is immediately passed back to main loop
-bool checkForHalt()
-{
-  if (CircuitPlayground.rightButton()) { haelp(); return true; }
-  return false;
 }
 
 /*
@@ -338,11 +347,6 @@ void driveStop()
 }
 
 /*
- * touch sensor functions
- */
-// TODO
-
-/*
  * LIDAR functions
  */
 
@@ -365,14 +369,14 @@ bool lidarConnect()
   setStatus(STATUS_LIDAR_CONNECTING);
   // try to detect RPLIDAR
   rplidar_response_device_info_t info;
-  if (IS_OK(lidar.getDeviceInfo(info, 100)))
+  if (IS_OK(lidar.getDeviceInfo(info)))
   {
     debug("lidar.getDeviceInfo OK model=" + String(info.model) + " firmware_version=" + String(info.firmware_version) + " hardware_version=" + String(info.hardware_version));
     if (IS_OK(lidar.startScan()))
     {
       debug("lidar.startScan OK, starting motor");
-      // start motor rotating at max allowed speed
-      analogWrite(RPLIDAR_MOTOR, 255);
+      // start motor rotating
+      analogWrite(RPLIDAR_MOTOR, LIDAR_MOTOR_SPEED);
       delay(1000);
       return true;
     }
@@ -381,58 +385,65 @@ bool lidarConnect()
   return false;
 }
 
-// take one complete scan of the surroundings and update the buffer
+// take one (or more) complete scans of the surroundings and update the buffer
 // return TRUE if the buffer is updated, FALSE if there was a problem
 // and we have to stop to re-connect to the LIDAR.
 bool lidarScan()
 {
+  unsigned long startTime = millis();
   debug("lidarScan()");
+  //derive a couple of unchanging values, for a bit of efficiency
+  static unsigned int binSize = 360 / NAV_BUFFER_SIZE;
+  static unsigned int halfABin = binSize / 2;
   initNavBuffer();
   unsigned int pointsCollected = 0;
   unsigned int pointsThrownOut = 0;
   unsigned int startBits = 0;
+  setStatus(STATUS_SCANNING);
   while (true)
   {
     // wait for a data point
     if (IS_OK(lidar.waitPoint()))
     {
-      setStatus(STATUS_SCANNING);
       RPLidarMeasurement point = lidar.getCurrentPoint();
+      // we want this function to be fast - therefore round off the floating point values first thing
+      unsigned int theAngle = round(point.angle);
+      unsigned int theDistance = round(point.distance);
       if (point.startBit)
       {
         startBits++;
         if (startBits > OVERSCAN)
         {
           //finish the scan
-          debug("Scan complete; " + String(pointsCollected) + " points collected, " + String(pointsThrownOut) + " thrown out.");
+          debug("Scan complete; " + String(pointsCollected) + " points collected, " + String(pointsThrownOut) + " thrown out");
+          debug("Scan took " + String(millis() - startTime) + " milliseconds at overscan=" + OVERSCAN);
           return true;
         }
       }
-      if ((point.quality >= 15) && (point.distance > 10.0)) // filter out bad data points
+      if ((point.quality >= LIDAR_MINIMUM_QUALITY) && (theDistance > LIDAR_MINIMUM_DISTANCE)) // filter out bad data points
       {
         pointsCollected++;
         // normalize the heading
         // with the current mounting, "forward" is the direction reported by the lidar as
         // 90 degrees. we need that to be stored as 180 degrees (putting that in the middle
         // of the range makes the buffer indexing simpler).
-        float realAngle = point.angle + 90.0;
-        if (realAngle >= 360.0) realAngle -= 360.0;
+        theAngle += 90;
+        if (theAngle >= 360) theAngle -= 360;
         // consolidating the awkwardness here: to make navigation somewhat better, we want
         // "straight ahead" to be in the center of a bin, not on the dividing line between
-        // two bins. So navBuffer[0] is going to be directly aft (355-5), and
-        // navBuffer[NAV_BUFFER_SIZE/2] will be directly forward (175-185).
-        unsigned int bin = (unsigned int)((realAngle + 5.0) / (360.0 / (float)(NAV_BUFFER_SIZE)));
+        // two bins. So navBuffer[0] is going to be directly aft and
+        // navBuffer[NAV_BUFFER_SIZE/2] will be directly forward.
+        unsigned int bin = (unsigned int)((theAngle + halfABin) / binSize);
         if (bin == NAV_BUFFER_SIZE) bin = 0;  // awkward wrap around conversion
-        if ((navBuffer[bin].distanceNear == 0) || ((unsigned int)point.distance < navBuffer[bin].distanceNear))
-          navBuffer[bin].distanceNear = (unsigned int)point.distance;
-        if ((navBuffer[bin].distanceFar == 0) || ((unsigned int)point.distance > navBuffer[bin].distanceFar))
-          navBuffer[bin].distanceFar = (unsigned int)point.distance;
+        // save the nearest blip in each bin for obstacle detection
+        if ((navBuffer[bin].pointCount == 0) || (point.distance < navBuffer[bin].distanceNear))
+          navBuffer[bin].distanceNear = point.distance;
         navBuffer[bin].pointCount++;
       } else pointsThrownOut++;
     } else {
       // here if there's an error; return FALSE so the control loop
       // can stop the vehicle and recover
-      debug("Timed out while waiting for data point");
+      debug("lidarScan() timed out while waiting for data point");
       return false;
     }
   }
@@ -493,57 +504,55 @@ bool lidarScan()
  * navigation / obstacle-avoidance functions
  */
 
-// derived parameters
-// start and end nav buffer bin indexes for the obstacle detection cone
-const unsigned int NAV_AVOID_START = (NAV_BUFFER_SIZE / 2) - (NAV_AVOID_CONE / (360 / NAV_BUFFER_SIZE));
-const unsigned int NAV_AVOID_END = (NAV_BUFFER_SIZE / 2) - 1 + (NAV_AVOID_CONE / (360 / NAV_BUFFER_SIZE));
-
 // return the bin index of the nearest obstruction, or -1 if no obstructions are visible
 // inside the NAV_AVOID_CONE and within NAV_AVOID_DISTANCE millimeters.
-int navFindObstruction()
+int navFindObstruction(int sector = (NAV_BUFFER_SIZE / 2), int distance = NAV_AVOID_DISTANCE)
 {
   debug("navFindObstruction()");
   int bin = -1;
-  unsigned int range = NAV_AVOID_DISTANCE + 1;
-  for (int i = NAV_AVOID_START; i <= NAV_AVOID_END; i++)
-    if ((navBuffer[i].pointCount > 0) &&
-        (navBuffer[i].distanceNear < NAV_AVOID_DISTANCE) &&
-        (navBuffer[i].distanceNear < range))
+  unsigned int range = distance + 1;
+  for (int i = sector - NAV_AVOID_CONE; i <= sector + NAV_AVOID_CONE; i++)
+  {
+    int realIndex = (i + NAV_BUFFER_SIZE) % NAV_BUFFER_SIZE;  // handle indexes that span buffer boundaries
+    if (navBuffer[realIndex].pointCount == 0)
     {
-      bin = i;
-      range = navBuffer[i].distanceNear;
+      debug("I have no data for sector " + String(i) + ", declaring that sector obstructed.");
+      //bin = realIndex;
+      //range = 0;
+    } else if ((navBuffer[realIndex].distanceNear < distance) &&
+             (navBuffer[realIndex].distanceNear < range)) {
+      bin = realIndex;
+      range = navBuffer[realIndex].distanceNear;
     }
+  }
   if (bin == -1)
     debug("No obstruction detected");
   else
-    debug("Obstruction detected in sector " + String(bin) + ", range=" + String(range) + "mm");
+    debug("Nearest obstruction detected in sector " + String(bin) + ", range=" + String(range) + "mm");
   return bin;
 }
 
 // look at the entire nav buffer (360 degrees) and find the best escape route
 // from the given obstruction, or -1 if no escape can be found
-int navFindEscape(int obstruction)
+int navFindEscape()
 {
   debug("navFindEscape()");
   int bin = -1;
-  float highScore = 0;
+  int bestScore = NAV_BUFFER_SIZE / 2;
   for (int i = 0; i < NAV_BUFFER_SIZE; i++)
   {
     // for each bin, score it as a possible escape.
-    if (navBuffer[i].distanceFar > NAV_AVOID_DISTANCE)
+    // determine the number of sectors we would have to turn to reach this heading
+    int deviation = (NAV_BUFFER_SIZE / 2) - i;  // halfway point of the buffer is straight ahead
+    deviation = abs(deviation);  // arduino reference says not to nest operations inside abs()
+    // check to see if the current buffer would read as unobstructed if the vehicle were pointed
+    // to the heading being evaluated. if yes, the route gets a score by its deviation (lower
+    // being better) and we keep the lowest score.
+    if ((navFindObstruction(i, NAV_ESCAPE_DISTANCE) == -1) && (deviation < bestScore))
     {
-      // this bit may need some tweaking, but the idea is to value both
-      // a lower deviation from the current heading and a greater amount
-      // of escape distance.
-      float deviation = (float)(NAV_BUFFER_SIZE / 2) - 0.5 - (float)i;  // halfway point of the buffer is straight ahead
-      deviation = (float)(NAV_BUFFER_SIZE / 2) - abs(deviation);  // arduino reference says not to nest operations inside abs()
-      float score = deviation * (pow((float)(navBuffer[i].distanceFar), ESCAPE_WEIGHT));
-      if (score > highScore)
-      {
-        debug("New high score: sector " + String(i) + " range=" + String(navBuffer[i].distanceNear) + " deviation=" + String(deviation) + " score=" + String(score));
-        bin = i;
-        highScore = score;
-      }
+      debug("New high score: sector " + String(i) + " deviation=" + String(deviation));
+      bin = i;
+      bestScore = deviation;
     }
   }
   if (bin == -1) debug("No escape found.");
@@ -554,12 +563,12 @@ int navFindEscape(int obstruction)
 // return true if the vehicle is now pointed in a good direction,
 // false if not...except that losing the lidar connection will still
 // return true, because we don't want to TEMPORARY_HALT in that case.
-bool navEscape(int obstruction)
+bool navEscape()
 {
   debug("navEscape()");
   driveStop();
   // find the escape route
-  int escape = navFindEscape(obstruction);
+  int escape = navFindEscape();
   if (escape == -1)
   {
     // oh noes, no escape can be found
@@ -572,9 +581,6 @@ bool navEscape(int obstruction)
     debug("navFindEscape returned sector " + String(escape) + ", current heading? navEscape returning TRUE");
     return true;
   } else {
-    // save the observed distance of the escape route
-    unsigned int watchDistance = navBuffer[escape].distanceNear;
-    debug("watchDistance=" + String(watchDistance) + "mm");
     // figure out if we're turning left or right, then start turning
     if (escape < (NAV_BUFFER_SIZE / 2)) driveRotateLeft();
     else driveRotateRight();
@@ -589,22 +595,9 @@ bool navEscape(int obstruction)
         debug("LIDAR timeout - navEscape returning TRUE to attempt reconnect");
         return true;
       }
-      // maybe check here to make sure escape is still possible?
-      // note that we do NOT exit the loop here if it looks like the
-      // coast is clear - we may still be trying to find the high-scoring
-      // path from the original scan.
-      //escape = navFindEscape(obstruction);
-      //if (escape == -1) return false;
-      // are we pointed at the escape route yet?
-      unsigned int currentDistance = navBuffer[NAV_BUFFER_SIZE / 2].distanceFar;
-      debug("currentDistance=" + String(currentDistance));
-      float diff = ((float)currentDistance - (float)watchDistance) / (float)watchDistance;
-      if (abs(diff) <= ESCAPE_TOLERANCE)
-      {
-        // yes!
-        debug("Escape route is within tolerance - navEscape returning TRUE");
-        return true;
-      }
+      // check for clear road ahead
+      if (navFindObstruction() == -1) return true;  // get in losers
+      // otherwise keep looking
     }
   }
 }
@@ -626,13 +619,12 @@ bool situationCheck()
     debug("currentTilt=" + String(currentTilt) + ", calling for a halt");
     return false;
   }
-  // check to see if halt button is being pressed
+  // check to see if stop button is being pressed
   if (CircuitPlayground.rightButton())
   {
-    debug("Manual halt request (right button pushed)");
+    debug("Manual halt request (stop button pushed)");
     return false;
   }
-  // TODO: add touchpad checks here
   return true;
 }
 
@@ -641,20 +633,21 @@ bool situationCheck()
  */
 void debug(String str)
 {
-  if (USB_DEBUG)
-  {
-    String t = "00000000" + String(millis());
-    t.remove(0, t.length() - 8);
-    Serial.println(t + " | " + str);
-    Serial.flush();
-  }
+#ifdef USB_DEBUG
+  String t = "00000000" + String(millis());
+  t.remove(0, t.length() - 8);
+  Serial.println(t + " | " + str);
+  Serial.flush();
+#endif
 }
 
 void setup()
 {
-  if (USB_DEBUG) Serial.begin(9600);
-  debug("setup()");
   CircuitPlayground.begin(PIXEL_BRIGHTNESS);
+#ifdef USB_DEBUG
+  Serial.begin(57600);
+  debug("setup()");
+#endif
   // all other setup goes below here
   // neopixelInit should remain first
   // each init function should end with a call to status(STATUS_INITIALIZING)
@@ -704,31 +697,9 @@ void loop()
     } else {
       debug("Obstacle detected in sector " + String(obstruction) + ", stopping.");
       driveStop();
-      if (MANEUVER_DELAY != 0)
-      {
-        // pause and then take a new scan, in case we had a temporary (moving) obstruction
-        setStatus(STATUS_SCANNING);
-        delay(MANEUVER_DELAY);
-        if (lidarScan())
-        {
-          int newObstruction = navFindObstruction();
-          if (newObstruction != obstruction)
-          {
-            // something's moving in front of the vehicle...so delay again
-            // and take it from the top
-            debug("Obstruction is moving...still scanning");
-            delay(MANEUVER_DELAY);
-            return;
-          }
-        } else {
-          debug("LIDAR error (maneuver_delay loop)...attempting to reconnect");
-          lidarConnect();
-          return;
-        }
-      }
-      // else turn to a new heading
+      // turn to a new heading
       setStatus(STATUS_MANEUVERING);
-      bool ok = navEscape(obstruction);
+      bool ok = navEscape();
       if (!ok)
         // here if there was a problem during maneuvering
         // so wait to be rescued

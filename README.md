@@ -28,6 +28,12 @@ https://learn.adafruit.com/adafruit-crickit-creative-robotic-interactive-constru
 
 use of RPLIDAR requires the non-standard library https://github.com/robopeak/rplidar_arduino
 
+IMPORTANT NOTE: at the time of this writing, the RPLidar Adruino library has a bug. The
+RPLidar::begin method is declared to return bool but it does not actually return a value.
+In my testing, this caused the controller to lock up. This can be fixed by editing the
+files RPLidar.h and RPLidar.cpp and changing the RPLidar::begin method to return void in
+both places.
+ 
 the RPLIDAR is connected as generally described in the documentation (see
 http://www.robopeak.net/data/doc/rplidar/appnote/RPLDAPPN01-rplidar_appnote_arduinolib-enUS.pdf)
 
